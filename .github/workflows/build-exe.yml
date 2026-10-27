@@ -11,10 +11,11 @@ permissions:
 
 jobs:
   build:
+    name: Build Windows x64 (soft-colored vertical tabs)
     runs-on: windows-2025
     timeout-minutes: 120
     steps:
-      - name: Checkout workflow repository (including the original patch)
+      - name: Checkout workflow repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -22,7 +23,7 @@ jobs:
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
 
-      - name: Download upstream SumatraPDF source
+      - name: Download pinned SumatraPDF source
         shell: pwsh
         run: |
           git init sumatrapdf
@@ -32,53 +33,176 @@ jobs:
           git -C sumatrapdf checkout --detach FETCH_HEAD
           if ($LASTEXITCODE -ne 0) { throw 'Failed to check out SumatraPDF source' }
 
-      - name: Apply native tabs patch and fix missing C++ declaration
+      - name: Apply original vertical tabs patch and compiler fix
         shell: pwsh
         run: |
+          # Reuse the original embedded patch already stored in this repository's Git history.
           $original = (git show '365ce53e47f80ed54eca40baf1c0757c19583a67:.github/workflows/build-exe.yml') -join "`n"
-          if ($LASTEXITCODE -ne 0) { throw 'Original embedded patch was not found in Git history' }
+          if ($LASTEXITCODE -ne 0) { throw 'Original patch not found in Git history' }
           $match = [regex]::Match($original, '(?s)\$b64\s*=\s*@''\r?\n(.*?)\r?\n\s*''@')
-          if (-not $match.Success) { throw 'Embedded Python patch not found in original workflow' }
+          if (-not $match.Success) { throw 'Embedded patch data not found' }
           $bytes = [Convert]::FromBase64String(($match.Groups[1].Value -replace '\s', ''))
           [System.IO.File]::WriteAllBytes((Join-Path $PWD 'apply_patch.py'), $bytes)
           python .\apply_patch.py .\sumatrapdf
-          if ($LASTEXITCODE -ne 0) { throw 'C++ patch application failed' }
-
+          if ($LASTEXITCODE -ne 0) { throw 'Original C++ patch failed' }
           $cpp = (Resolve-Path '.\sumatrapdf\src\SumatraPDF.cpp').Path
           $source = [System.IO.File]::ReadAllText($cpp)
           $marker = 'constexpr UINT kVerticalTabsListId = 0x7D01;'
           if ([regex]::Matches($source, [regex]::Escape($marker)).Count -ne 1) {
-            throw 'Vertical-tab declaration insertion point not found exactly once'
+            throw 'Vertical tabs C++ insertion point was not found exactly once'
           }
           $source = $source.Replace($marker, "void SyncVerticalTabs(MainWindow*);`n$marker")
           [System.IO.File]::WriteAllText($cpp, $source, [System.Text.UTF8Encoding]::new($false))
-          if (-not $source.Contains('static void CreateVerticalTabs')) { throw 'Vertical tab UI was not generated' }
-          Write-Host 'Vertical tabs C++ patch and forward declaration verified.'
+          if (-not $source.Contains('static void CreateVerticalTabs')) { throw 'Original UI patch missing' }
+          Write-Host 'Original native vertical tabs applied.'
 
-      - name: Build Windows x64 portable executables
+      - name: Apply six muted colors and visual refinements
+        shell: pwsh
+        run: |
+          $themeScript = @'
+          from pathlib import Path
+
+          cpp = Path('sumatrapdf/src/SumatraPDF.cpp')
+          source = cpp.read_text(encoding='utf-8')
+
+          def replace_once(old, new, label):
+              global source
+              count = source.count(old)
+              if count != 1:
+                  raise RuntimeError(f'{label}: expected one match, found {count}')
+              source = source.replace(old, new, 1)
+
+          palette = r'''constexpr UINT kVerticalTabsListId = 0x7D01;
+          // Low-saturation blue, lavender, mint, sand, slate and rose.
+          static const COLORREF kVTabRowColors[] = {
+              RGB(234, 241, 248), RGB(241, 237, 247), RGB(234, 243, 239),
+              RGB(247, 242, 233), RGB(239, 242, 247), RGB(247, 237, 240)
+          };
+          static const COLORREF kVTabSelected = RGB(208, 224, 239);
+          static const COLORREF kVTabPanelBg = RGB(241, 244, 248);
+          static const COLORREF kVTabDivider = RGB(220, 226, 233);
+          static const COLORREF kVTabAccent = RGB(89, 118, 153);
+          static const COLORREF kVTabText = RGB(43, 56, 72);
+          static const COLORREF kVTabClose = RGB(104, 116, 133);
+          '''
+          replace_once('constexpr UINT kVerticalTabsListId = 0x7D01;', palette, 'Theme palette')
+
+          start_tag = 'static void DrawVerticalTab(DRAWITEMSTRUCT* d) {'
+          end_tag = '\nstatic LRESULT CALLBACK VerticalTabsSubclass'
+          if source.count(start_tag) != 1 or source.count(end_tag) != 1:
+              raise RuntimeError('Cannot locate the original vertical tab renderer')
+          begin = source.index(start_tag)
+          end = source.index(end_tag, begin)
+          renderer = r'''static void DrawVerticalTab(DRAWITEMSTRUCT* d) {
+              if (d->itemID == (UINT)-1) return;
+              const bool selected = (d->itemState & ODS_SELECTED) != 0;
+              const int paletteIndex = (int)(d->itemID % 6);
+              const COLORREF bg = selected ? kVTabSelected : kVTabRowColors[paletteIndex];
+              HBRUSH rowBrush = CreateSolidBrush(bg);
+              FillRect(d->hDC, &d->rcItem, rowBrush);
+              DeleteObject(rowBrush);
+
+              // A subtle 1px divider gives every PDF its own visual space.
+              RECT separator = d->rcItem;
+              separator.top = separator.bottom - 1;
+              HBRUSH lineBrush = CreateSolidBrush(kVTabDivider);
+              FillRect(d->hDC, &separator, lineBrush);
+              DeleteObject(lineBrush);
+
+              if (selected) {
+                  RECT accent = d->rcItem;
+                  accent.left += DpiScale(3);
+                  accent.right = accent.left + DpiScale(4);
+                  accent.top += DpiScale(5);
+                  accent.bottom -= DpiScale(5);
+                  HBRUSH accentBrush = CreateSolidBrush(kVTabAccent);
+                  FillRect(d->hDC, &accent, accentBrush);
+                  DeleteObject(accentBrush);
+              }
+
+              SetBkMode(d->hDC, TRANSPARENT);
+              SetTextColor(d->hDC, kVTabText);
+              WCHAR title[1024] = L"";
+              int titleLen = (int)SendMessageW(d->hwndItem, LB_GETTEXTLEN, d->itemID, 0);
+              if (titleLen >= 0 && titleLen < 1024) {
+                  SendMessageW(d->hwndItem, LB_GETTEXT, d->itemID, (LPARAM)title);
+              } else {
+                  lstrcpyW(title, L"...");
+              }
+              RECT textRect = d->rcItem;
+              textRect.left += DpiScale(16);
+              textRect.right -= DpiScale(35);
+              DrawTextW(d->hDC, title, -1, &textRect,
+                        DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+              RECT closeRect = d->rcItem;
+              closeRect.left = closeRect.right - DpiScale(28);
+              SetTextColor(d->hDC, kVTabClose);
+              DrawTextW(d->hDC, L"\u00D7", -1, &closeRect,
+                        DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
+          }
+          '''
+          source = source[:begin] + renderer + source[end:]
+
+          # Color the list's empty space; preserve SumatraPDF's document and TOC colors.
+          target = '        case WM_MEASUREITEM:'
+          replacement = '''        case WM_CTLCOLORLISTBOX: {
+              if (win && (HWND)lp == win->hwndVerticalTabs) {
+                  static HBRUSH panelBrush = CreateSolidBrush(kVTabPanelBg);
+                  HDC dc = (HDC)wp;
+                  SetBkColor(dc, kVTabPanelBg);
+                  SetTextColor(dc, kVTabText);
+                  return (LRESULT)panelBrush;
+              }
+              break;
+          }
+
+                  case WM_MEASUREITEM:'''
+          # Dedent the last case label to match the switch's indentation.
+          replacement = replacement.replace('                  case WM_MEASUREITEM:', target)
+          replace_once(target, replacement, 'Listbox background')
+
+          replace_once('SendMessageW(list, LB_SETITEMHEIGHT, 0, DpiScale(36));',
+                       'SendMessageW(list, LB_SETITEMHEIGHT, 0, DpiScale(40));', 'Row height')
+          replace_once('((MEASUREITEMSTRUCT*)lp)->itemHeight = DpiScale(36);',
+                       '((MEASUREITEMSTRUCT*)lp)->itemHeight = DpiScale(40);', 'Measured row height')
+
+          cpp.write_text(source, encoding='utf-8', newline='\n')
+          print('Applied: six muted row colors, selected accent, dividers, colored background, 40px rows.')
+          '@
+          Set-Content -Path .\theme_tabs.py -Value $themeScript -Encoding utf8
+          python .\theme_tabs.py
+          if ($LASTEXITCODE -ne 0) { throw 'Vertical tabs theme patch failed' }
+          if (-not (Select-String -Path .\sumatrapdf\src\SumatraPDF.cpp -Pattern 'kVTabRowColors' -Quiet)) {
+            throw 'Theme verification failed'
+          }
+
+      - name: Compile Windows x64 release
         shell: pwsh
         working-directory: sumatrapdf
         run: |
           bun .\cmd\build.ts -all
-          if ($LASTEXITCODE -ne 0) { throw 'C++ build failed; check first compiler error above' }
+          if ($LASTEXITCODE -ne 0) { throw 'C++ compilation failed; inspect the first compiler error' }
 
-      - name: Verify executables
+      - name: Verify portable executables
         shell: pwsh
         run: |
           foreach ($file in @('SumatraPDF.exe', 'SumatraPDF-static.exe')) {
             $path = Join-Path 'sumatrapdf\out\rel64' $file
-            if (-not (Test-Path $path)) { throw "Missing output: $path" }
+            if (-not (Test-Path $path)) { throw "Missing executable: $path" }
             $stream = [System.IO.File]::OpenRead((Resolve-Path $path).Path)
             try {
-              if ($stream.ReadByte() -ne 77 -or $stream.ReadByte() -ne 90) { throw "Not a Windows executable: $path" }
+              if ($stream.ReadByte() -ne 77 -or $stream.ReadByte() -ne 90) {
+                throw "Invalid Windows PE signature: $path"
+              }
             } finally { $stream.Dispose() }
             Get-Item $path | Select-Object FullName, Length
           }
 
-      - name: Upload EXE files
+      - name: Upload portable EXE files
         uses: actions/upload-artifact@v4
         with:
-          name: SumatraPDF-VerticalTabs-Windows-x64
+          name: SumatraPDF-VerticalTabs-MutedColors-Windows-x64
           path: |
             sumatrapdf/out/rel64/SumatraPDF.exe
             sumatrapdf/out/rel64/SumatraPDF-static.exe
