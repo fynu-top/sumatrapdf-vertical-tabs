@@ -1,0 +1,1 @@
+# sumatrapdf-vertical-tabs
